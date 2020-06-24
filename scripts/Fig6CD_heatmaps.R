@@ -18,31 +18,45 @@ meta <- read_csv("data_clean/Shah.metadata.csv") %>%
   arrange(status, cell) %>% 
   column_to_rownames("sampID")
 
-#### Format counts #####
-counts.sub <- counts %>% 
+#### Calculate Z scores #####
+counts.long <- counts %>% 
   #Remove module 0 
   filter(module != "00") %>% 
   #Add metadata
   pivot_longer(-module, names_to = "rowname") %>% 
   left_join(rownames_to_column(meta)) %>% 
-  select(-rowname) %>% 
-  #calculate mean w/in group
+  select(-rowname)
+
+#Mean and SD for each module
+mean.mod <- counts.long %>% 
+  group_by(module) %>% 
+  summarize(mod.mean = mean(value, na.rm=TRUE),
+            mod.sd = sd(value, na.rm=TRUE)) %>% 
+  ungroup() 
+
+#Calculate Z-score
+z.score <- full_join(counts.long, mean.mod,
+                     by = c("module")) %>% 
   group_by(module, status, cell) %>% 
-  summarize(count.mean = mean(value, na.rm=TRUE)) %>% 
+  mutate(z = (value - mod.mean) / mod.sd) %>% 
   ungroup() %>% 
   
   #Recode treatment groups
   mutate(group = paste(status,cell, sep="_")) %>% 
-
-  arrange(group) %>% 
-  select(module, group, count.mean) %>% 
-  pivot_wider(names_from = group, values_from = count.mean) %>% 
   
+  #Mean z score for groups
+  group_by(module, group) %>% 
+  summarize(z.mean = mean(z, na.rm=TRUE)) %>% 
+  #Wide format
+  arrange(group) %>% 
+  select(module, group, z.mean) %>% 
+  pivot_wider(names_from = group, values_from = z.mean) %>% 
+  #Remove leading 0 in module name
+  mutate(module = sub("^0+", "", module)) %>% 
   #format to matrix
   column_to_rownames("module") %>% 
   as.matrix()
-
-
+  
 #### Format meta #####
 meta.sub<- meta %>% 
   #Recode treatment groups
@@ -54,7 +68,7 @@ meta.sub<- meta %>%
 
 #### FIGURE 6C: MODULES ####
 #### Tree ####
-corr.pv <- pvclust(t(counts.sub), nboot=1000, 
+corr.pv <- pvclust(t(z.score), nboot=1000, 
                    method.hclust="average", method.dist="correlation")
 
 #### column (module) annotation ####
@@ -91,16 +105,20 @@ col_legend <- Legend(title = "Significant\nfold change",
                      labels = c("Up","Down"))
 
 #### heatmap ####
-rowNames <- c(expression(Infected~italic(Tollip^"-/-")),
-              expression(Infected~italic(Tollip^"+/+")),
-              expression(Uninfected~italic(Tollip^"-/-")),
-              expression(Uninfected~italic(Tollip^"+/+")))
+rowNames <- c(expression(Uninfected~italic(Tollip^"-/-")),
+              expression(Uninfected~italic(Tollip^"+/+")),
+              expression(Infected~italic(Tollip^"-/-")),
+              expression(Infected~italic(Tollip^"+/+")))
 
-mod_hm <- Heatmap(t(counts.sub), name = "Mean log2\nexpression",
+mod_hm <- Heatmap(t(z.score), name = "Mean\nZ-score",
                   #Expression colors
                   col = magma(20),
                   #Sample annot
-                  row_split = c(2,2,1,1),
+                  row_order = c("Uninfected_WT",
+                                "Uninfected_TKO",
+                                "Infected_WT",
+                                "Infected_TKO"),
+                  row_split = c(1,1,2,2),
                   row_gap = unit(5, "mm"),
                   show_row_dend = FALSE,
                   row_title = " ",
@@ -119,7 +137,7 @@ mod_hm <- Heatmap(t(counts.sub), name = "Mean log2\nexpression",
                   heatmap_width = unit(24, "cm"))
 
 #### Save ####
-pdf(file = "figs/publication/heatmap_modules.4groups.pdf", 
+pdf(file = "figs/publication/heatmap_modules.4groups.Zscore.pdf", 
     height=6, width=12)
 
 draw(mod_hm, annotation_legend_list=list(col_legend))
@@ -127,9 +145,45 @@ dev.off()
 
 ##### FIGURE 6D: HALLMARK TERMS #####
 #### Data ####
-hallmark <- read_csv("results/GSEA/GSEA_modules_H.csv") 
+hallmark <- read_csv("results/GSEA/GSEA_modules_H.csv")
 
 FDR.cutoff <- .05
+
+#### Format data: FDR####
+#
+hallmark_fdr <- hallmark %>% 
+  #remove mod 0
+  filter(group != "00") %>% 
+  #Calculate proportion of genes in term
+  select(group, Description, size.overlap.term, 
+         size.group, p.adjust) %>% 
+  mutate(fdr.scale = -log10(p.adjust)) %>% 
+  #Format labels
+  mutate(Description = gsub("HALLMARK_","",Description),
+         Description = gsub("_", " ", Description) )
+
+#list terms with at least 1 module FDR < 0.5
+hallmark_summ <- hallmark_fdr %>% 
+  group_by(Description) %>% 
+  summarize(fdr.min = min(p.adjust)) %>% 
+  arrange(-fdr.min)
+
+terms.to.keep <- hallmark_summ %>% 
+  filter(fdr.min<=FDR.cutoff) %>% 
+  select(Description) %>% unlist(use.names = FALSE)
+
+hallmark_sub <- hallmark_fdr %>% 
+  filter(Description %in% terms.to.keep) %>% 
+  #Wide format
+  select(group, Description, fdr.scale) %>% 
+  pivot_wider(names_from = Description, values_from = fdr.scale) %>% 
+  arrange(group) %>% 
+  #Fill NAs
+  mutate_if(is.numeric, ~ifelse(is.na(.),0,.)) %>% 
+  #To matrix
+  column_to_rownames("group") %>% 
+  as.matrix()
+
 
 #### Format data ####
 #Calculate percent of genes in term
@@ -181,7 +235,7 @@ col_annot <- HeatmapAnnotation(
                              location = unit(2, "npc")))
 
 #### heatmap ####
-hallmark_hm <- Heatmap(t(hallmark_sub), name = "Percent genes\nin module",
+hallmark_hm <- Heatmap(t(hallmark_sub), name = "-log10(FDR)",
                        #Expression colors
                        col = magma(20),
                        #Module annot
@@ -201,7 +255,7 @@ hallmark_hm <- Heatmap(t(hallmark_sub), name = "Percent genes\nin module",
 
 #### save
 pdf(file = paste("figs/publication/heatmap_hallmark_FDR",
-                 FDR.cutoff, ".pdf", sep=""), 
+                 FDR.cutoff, "B.pdf", sep=""), 
     height=9, width=12)
 
 draw(hallmark_hm, annotation_legend_list=list(col_legend))
